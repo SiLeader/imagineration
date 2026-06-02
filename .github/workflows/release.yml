@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PNPM_VERSION: 10.33.0
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+
+      - name: Set up pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+
+      - name: Build release binaries
+        run: |
+          New-Item -ItemType Directory -Force release\with-frontend | Out-Null
+          New-Item -ItemType Directory -Force release\without-frontend | Out-Null
+
+          cargo build --release --features vulkan,cuda,frontend
+          Move-Item target\release\imagineration.exe release\with-frontend\imagineration.exe
+
+          cargo build --release --features vulkan,cuda
+          Move-Item target\release\imagineration.exe release\without-frontend\imagineration.exe
+
+          Compress-Archive -Path release\with-frontend,release\without-frontend -DestinationPath imagineration-${{ github.ref_name }}-windows-x86_64.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: imagineration-windows-x86_64
+          path: imagineration-${{ github.ref_name }}-windows-x86_64.zip
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+
+      - name: Set up pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+
+      - name: Build release binaries
+        run: |
+          mkdir -p release/{with-frontend,without-frontend}
+
+          cargo build --release --features vulkan,cuda,frontend
+          mv target/release/imagineration release/with-frontend/imagineration
+
+          cargo build --release --features vulkan,cuda
+          mv target/release/imagineration release/without-frontend/imagineration
+
+          tar -C release -czf imagineration-${{ github.ref_name }}-linux-x86_64.tar.gz with-frontend without-frontend
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: imagineration-linux-x86_64
+          path: imagineration-${{ github.ref_name }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+
+      - name: Set up pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+
+      - name: Build release binaries
+        run: |
+          mkdir -p release/{with-frontend,without-frontend}
+
+          cargo build --release --features metal,frontend
+          mv target/release/imagineration release/with-frontend/imagineration
+
+          cargo build --release --features metal
+          mv target/release/imagineration release/without-frontend/imagineration
+
+          tar -C release -czf imagineration-${{ github.ref_name }}-macos.tar.gz with-frontend without-frontend
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: imagineration-macos
+          path: imagineration-${{ github.ref_name }}-macos.tar.gz
+          if-no-files-found: error
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: [ build-windows, build-linux, build-macos ]
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -d '' assets < <(find artifacts -type f -print0 | sort -z)
+          if ((${#assets[@]} == 0)); then
+            echo "No release assets found."
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --title "${GITHUB_REF_NAME}" --generate-notes
