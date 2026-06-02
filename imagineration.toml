@@ -1,0 +1,21 @@
+[server]
+host = "127.0.0.1"
+port = 3000
+# Maximum accepted request body size in bytes. Base64-encoded input images (init/mask/control/ref)
+# count toward this limit, so raise it if you submit large inputs. Default: 64 MiB.
+max_body_bytes = 67108864
+
+[paths]
+models_dir = "models"
+images_dir = "data/images"
+
+[generation]
+# Maximum number of image generations executed concurrently. Generation loads models into
+# memory/VRAM and is CPU/GPU-bound, so it is serialized by default. Increase only if you have the
+# resources to run multiple generations at once.
+max_concurrent = 1
+
+[frontend]
+# Serves the embedded SPA when the binary was built with `--features frontend`.
+# If the feature is not enabled at build time, this setting cannot add frontend assets.
+enabled = true

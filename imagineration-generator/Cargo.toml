@@ -1,0 +1,17 @@
+[package]
+name = "imagineration-generator"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+diffusion-rs = { workspace = true }
+image = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+cuda = ["diffusion-rs/cuda"]
+vulkan = ["diffusion-rs/vulkan"]
+metal = ["diffusion-rs/metal"]
+hip = ["diffusion-rs/hipblas"]
