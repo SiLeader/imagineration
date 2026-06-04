@@ -19,3 +19,32 @@ max_concurrent = 1
 # Serves the embedded SPA when the binary was built with `--features frontend`.
 # If the feature is not enabled at build time, this setting cannot add frontend assets.
 enabled = true
+
+[auth]
+# Bearer-token authentication for the `/v1` API. Two mechanisms are supported and combined with
+# OR semantics: fixed tokens and OIDC JWTs.
+#
+#   - Configure both        -> a request authenticates if it satisfies EITHER mechanism.
+#   - Configure only one    -> only that mechanism is active.
+#   - Configure neither     -> authentication is DISABLED and every request passes (the default).
+#
+# Clients authenticate with an `Authorization: Bearer <token>` header. The frontend SPA and its
+# assets are served without authentication; only the `/v1` API is protected.
+
+# Fixed bearer tokens accepted verbatim. Leave empty (or omit) to disable fixed-token auth.
+static_tokens = []
+
+# OIDC JWT verification. Omit the entire `[auth.jwt]` table to disable JWT auth.
+# The verifying keys are supplied as a JWKS document (the JSON published by OIDC providers at
+# their `jwks_uri`), either inline via `jwks` or from a file via `jwks_path`.
+# [auth.jwt]
+# # Expected `iss` claim. When set, tokens from a different issuer are rejected.
+# issuer = "https://issuer.example.com/"
+# # Accepted `aud` claim values. When empty, the audience claim is not validated.
+# audiences = ["imagineration"]
+# # Permitted signature algorithms. Defaults to ["RS256"] when omitted.
+# algorithms = ["RS256"]
+# # Provide the JWKS inline ...
+# jwks = '''{ "keys": [ /* ... */ ] }'''
+# # ... or load it from a file (mutually exclusive with `jwks`; `jwks` takes precedence).
+# jwks_path = "oidc-jwks.json"

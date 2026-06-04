@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::auth::{AuthInitError, Authenticator};
 use crate::config::Settings;
 pub use error::*;
 
@@ -75,17 +76,28 @@ fn parse_uuid(value: &str) -> Result<Uuid, AppError> {
 pub struct AppState {
     settings: Arc<Settings>,
     generation_semaphore: Arc<Semaphore>,
+    authenticator: Arc<Authenticator>,
 }
 
-pub fn router(settings: Settings) -> Router {
+impl AppState {
+    pub(crate) fn authenticator(&self) -> &Authenticator {
+        &self.authenticator
+    }
+}
+
+pub fn router(settings: Settings) -> Result<Router, AuthInitError> {
     let max_body_bytes = settings.server.max_body_bytes;
     let max_concurrent = settings.generation.max_concurrent.max(1);
     let frontend_enabled = settings.frontend.enabled;
+    let authenticator = Authenticator::from_settings(&settings.auth)?;
     let state = AppState {
         settings: Arc::new(settings),
         generation_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+        authenticator: Arc::new(authenticator),
     };
-    let router = Router::new()
+    // Authentication is layered onto the API routes only; merging the frontend afterwards keeps
+    // the SPA and its assets outside the authenticated surface.
+    let api = Router::new()
         .route("/v1/models", get(list_models::list_models))
         .route(
             "/v1/images:generate",
@@ -98,8 +110,12 @@ pub fn router(settings: Settings) -> Router {
             get(get_image_metadata::get_image_metadata),
         )
         .layer(DefaultBodyLimit::max(max_body_bytes))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_auth,
+        ))
         .with_state(state);
-    maybe_mount_frontend(router, frontend_enabled)
+    Ok(maybe_mount_frontend(api, frontend_enabled))
 }
 
 #[cfg(feature = "frontend")]
@@ -145,9 +161,28 @@ mod tests {
     }
 
     async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
-        let app = router(test_settings());
+        let app = router(test_settings()).unwrap();
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body.to_vec())
+    }
+
+    async fn get_with_auth(
+        settings: Settings,
+        uri: &str,
+        bearer: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
+        let app = router(settings).unwrap();
+        let mut builder = Request::builder().uri(uri);
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .oneshot(builder.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -173,5 +208,69 @@ mod tests {
     async fn get_image_rejects_non_uuid_path() {
         let (status, _) = get("/v1/images/not-a-uuid").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    fn settings_with_static_token(token: &str) -> Settings {
+        let mut settings = test_settings();
+        settings.auth.static_tokens = vec![token.to_owned()];
+        settings
+    }
+
+    #[tokio::test]
+    async fn api_allows_requests_when_auth_disabled() {
+        // No auth configured: the v1 API is reachable without any credential.
+        let (status, _) = get_with_auth(test_settings(), "/v1/models", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_missing_token_when_static_auth_enabled() {
+        let (status, _) =
+            get_with_auth(settings_with_static_token("secret"), "/v1/models", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_wrong_token_when_static_auth_enabled() {
+        let (status, _) = get_with_auth(
+            settings_with_static_token("secret"),
+            "/v1/models",
+            Some("nope"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_accepts_correct_static_token() {
+        let (status, _) = get_with_auth(
+            settings_with_static_token("secret"),
+            "/v1/models",
+            Some("secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_sets_www_authenticate_header() {
+        let app = router(settings_with_static_token("secret")).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer")
+        );
     }
 }

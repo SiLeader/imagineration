@@ -29,6 +29,14 @@ impl AppError {
         }
     }
 
+    pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -54,15 +62,23 @@ impl IntoResponse for AppError {
         {
             tracing::error!(status = %self.status, detail, "request failed with internal error");
         }
-        (
-            self.status,
+        let status = self.status;
+        let mut response = (
+            status,
             Json(ErrorBody {
                 error: ErrorMessage {
                     message: self.message,
                 },
             }),
         )
-            .into_response()
+            .into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
 }
 
