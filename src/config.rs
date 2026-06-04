@@ -13,6 +13,7 @@ pub struct Settings {
     pub generation: GenerationSettings,
     pub frontend: FrontendSettings,
     pub auth: AuthSettings,
+    pub presets: PresetSettings,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,12 +45,13 @@ pub struct FrontendSettings {
 
 /// Authentication settings.
 ///
-/// Two mechanisms are supported and combined with OR semantics:
-/// fixed bearer tokens (`static_tokens`) and OIDC JWTs (`[auth.jwt]`).
+/// Several mechanisms are supported and combined with OR semantics: fixed bearer tokens
+/// (`static_tokens`), tokens issued to local username/password users (`[[auth.users]]`), JWTs
+/// minted locally by this server (`[auth.issuer]`), and OIDC JWTs verified against a JWKS
+/// (`[auth.jwt]`).
 ///
-/// - If both are configured, a request authenticates when it satisfies *either*.
-/// - If only one is configured, only that mechanism is active.
-/// - If neither is configured, authentication is disabled and all requests pass.
+/// - A request authenticates when it satisfies *any* configured mechanism.
+/// - If none is configured, authentication is disabled and all requests pass.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
@@ -57,6 +59,40 @@ pub struct AuthSettings {
     pub static_tokens: Vec<String>,
     /// OIDC JWT verification. Omit the entire `[auth.jwt]` table to disable JWT auth.
     pub jwt: Option<JwtSettings>,
+    /// Local username/password users for the `/v1/auth/login` token-issuing endpoint.
+    pub users: Vec<UserSettings>,
+    /// Local JWT issuance. When present, `/v1/auth/login` mints a signed JWT (acting as a simple
+    /// IdP); when absent, the endpoint returns each user's configured static `token`.
+    pub issuer: Option<IssuerSettings>,
+}
+
+/// A local user that may exchange a username/password for a token at `/v1/auth/login`.
+///
+/// Supply exactly one of `password` (plaintext, for simple deployments) or `password_sha256`
+/// (a lowercase hex SHA-256 digest of the password). `token` is the bearer token returned on a
+/// successful login when local JWT issuance (`[auth.issuer]`) is not configured.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UserSettings {
+    pub username: String,
+    pub password: Option<String>,
+    pub password_sha256: Option<String>,
+    pub token: Option<String>,
+}
+
+/// Local JWT issuance settings. Tokens are signed with HS256 using `secret` and are verified by
+/// this same server, so configuring `[auth.issuer]` enables both minting and accepting these JWTs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct IssuerSettings {
+    /// HS256 signing secret. Required for local JWT issuance.
+    pub secret: Option<String>,
+    /// `iss` claim placed on issued tokens and required when verifying them.
+    pub issuer: Option<String>,
+    /// `aud` claim placed on issued tokens and required when verifying them.
+    pub audience: Option<String>,
+    /// Token lifetime in seconds. Defaults to 3600 (one hour) when omitted.
+    pub ttl_seconds: Option<i64>,
 }
 
 /// Information required to verify OIDC JWTs presented as bearer tokens.
@@ -76,6 +112,37 @@ pub struct JwtSettings {
     pub jwks: Option<String>,
     /// Path to a JWKS document (JSON) holding the verifying keys.
     pub jwks_path: Option<PathBuf>,
+    /// URL of a remote JWKS endpoint (an OIDC provider's `jwks_uri`, e.g. Google). The document is
+    /// fetched over HTTPS at startup and re-fetched on demand when a token presents an unknown key
+    /// id, so the verifying keys need not be available locally.
+    pub jwks_uri: Option<String>,
+}
+
+/// User-defined preset feature settings.
+///
+/// The `/v1/presets` API and its persistence only exist when the binary is built with the
+/// `presets` cargo feature; this table additionally controls the runtime backend and whether the
+/// feature is active.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PresetSettings {
+    /// Whether the preset API is mounted (only effective when built with the `presets` feature).
+    pub enabled: bool,
+    /// Storage backend: `memory`, `file`, or `sqlite`.
+    pub backend: String,
+    /// Backend location: the JSON file path (`file`) or the SQLite database path (`sqlite`).
+    /// Ignored by the `memory` backend.
+    pub path: Option<PathBuf>,
+}
+
+impl Default for PresetSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: "memory".to_owned(),
+            path: None,
+        }
+    }
 }
 
 impl Settings {
@@ -122,4 +189,20 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_config_parses() {
+        // Guards against the example config drifting away from the `Settings` shape.
+        let raw = include_str!("../imagineration.toml");
+        let settings: Settings = toml::from_str(raw).expect("imagineration.toml should parse");
+        assert_eq!(settings.server.port, 3000);
+        assert!(settings.presets.enabled);
+        assert_eq!(settings.presets.backend, "memory");
+        assert!(settings.auth.static_tokens.is_empty());
+    }
 }

@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(config = %args.config.display(), "loading configuration");
     let settings = Settings::load(&args.config)?;
     let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
-    let app = routes::router(settings)?;
+    let app = routes::router(settings).await?;
 
     tracing::info!("listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;

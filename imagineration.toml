@@ -21,30 +21,65 @@ max_concurrent = 1
 enabled = true
 
 [auth]
-# Bearer-token authentication for the `/v1` API. Two mechanisms are supported and combined with
-# OR semantics: fixed tokens and OIDC JWTs.
+# Bearer-token authentication for the `/v1` API. Several mechanisms are supported and combined with
+# OR semantics: fixed tokens, tokens issued to local username/password users, JWTs minted locally
+# by this server, and OIDC JWTs verified against a JWKS.
 #
-#   - Configure both        -> a request authenticates if it satisfies EITHER mechanism.
-#   - Configure only one    -> only that mechanism is active.
-#   - Configure neither     -> authentication is DISABLED and every request passes (the default).
+#   - A request authenticates if it satisfies ANY configured mechanism.
+#   - Configure nothing -> authentication is DISABLED and every request passes (the default).
 #
-# Clients authenticate with an `Authorization: Bearer <token>` header. The frontend SPA and its
-# assets are served without authentication; only the `/v1` API is protected.
+# Clients authenticate with an `Authorization: Bearer <token>` header. The frontend SPA, its
+# assets, `POST /v1/auth/login`, and `GET /v1/capabilities` are served without authentication;
+# every other `/v1` endpoint is protected.
 
 # Fixed bearer tokens accepted verbatim. Leave empty (or omit) to disable fixed-token auth.
 static_tokens = []
 
-# OIDC JWT verification. Omit the entire `[auth.jwt]` table to disable JWT auth.
-# The verifying keys are supplied as a JWKS document (the JSON published by OIDC providers at
-# their `jwks_uri`), either inline via `jwks` or from a file via `jwks_path`.
+# Local username/password users for the `POST /v1/auth/login` token-issuing endpoint. Each user
+# provides exactly one of `password` (plaintext) or `password_sha256` (lowercase hex SHA-256 of the
+# password). Without `[auth.issuer]`, login returns the user's `token` (also accepted as a bearer
+# token); with `[auth.issuer]`, login instead mints a signed JWT and `token` is ignored.
+# [[auth.users]]
+# username = "alice"
+# password = "change-me"
+# # password_sha256 = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+# token = "alice-static-token"
+
+# Local JWT issuance (a simple built-in IdP). When present, `POST /v1/auth/login` mints HS256 JWTs
+# signed with `secret`; the same server verifies them, so no JWKS configuration is needed for these
+# tokens. Omit this table to have login return static tokens instead.
+# [auth.issuer]
+# secret = "a-long-random-signing-secret"
+# issuer = "imagineration"
+# audience = "imagineration"
+# ttl_seconds = 3600
+
+# OIDC JWT verification for tokens issued by an external IdP (e.g. Google). Omit the entire
+# `[auth.jwt]` table to disable. The verifying keys are supplied as a JWKS document, either inline
+# via `jwks`, from a file via `jwks_path`, or fetched from a remote `jwks_uri` (so the keys need not
+# be available locally; they are re-fetched on demand when a token presents an unknown key id).
 # [auth.jwt]
 # # Expected `iss` claim. When set, tokens from a different issuer are rejected.
-# issuer = "https://issuer.example.com/"
+# issuer = "https://accounts.google.com"
 # # Accepted `aud` claim values. When empty, the audience claim is not validated.
-# audiences = ["imagineration"]
+# audiences = ["your-oauth-client-id"]
 # # Permitted signature algorithms. Defaults to ["RS256"] when omitted.
 # algorithms = ["RS256"]
 # # Provide the JWKS inline ...
 # jwks = '''{ "keys": [ /* ... */ ] }'''
-# # ... or load it from a file (mutually exclusive with `jwks`; `jwks` takes precedence).
+# # ... or load it from a file (mutually exclusive with `jwks`; `jwks` takes precedence) ...
 # jwks_path = "oidc-jwks.json"
+# # ... or fetch it from a remote endpoint (an OIDC provider's `jwks_uri`).
+# jwks_uri = "https://www.googleapis.com/oauth2/v3/certs"
+
+[presets]
+# User-defined generation presets (per-user saved model set, LoRA/VAE, prompts, steps, CFG, size,
+# etc.). The `/v1/presets` API and UI only exist when the binary is built with the `presets` cargo
+# feature (and, for the UI, `frontend`).
+enabled = true
+# Storage backend: "memory" (non-persistent), "file" (JSON document), or "sqlite" (requires the
+# `presets-sqlite` build feature).
+backend = "memory"
+# Backend location: the JSON file path for "file", or the SQLite database path for "sqlite"
+# (omit, or use ":memory:", for an ephemeral SQLite database). Ignored by the "memory" backend.
+# path = "data/presets.json"

@@ -6,6 +6,9 @@ use std::{
 };
 
 const DIST_DIR: &str = "dist";
+/// Records which crate features the committed `dist/` was built with, so the assets are rebuilt
+/// when the feature set changes even if no source file is newer than `index.html`.
+const BUILD_FLAGS_FILE: &str = ".build-flags";
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -14,21 +17,40 @@ fn main() {
     let index = dist_dir.join("index.html");
 
     println!("cargo:rerun-if-changed={}", source_dir.display());
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PRESETS");
 
-    if should_build_frontend(&source_dir, &index).expect("check frontend asset freshness") {
+    // The `presets` crate feature is surfaced to the Vite build as `VITE_PRESETS_ENABLED`, which
+    // the SPA reads to compile the preset UI in or out.
+    let presets_enabled = env::var_os("CARGO_FEATURE_PRESETS").is_some();
+    let desired_flags = format!("presets={}", u8::from(presets_enabled));
+    let flags_changed = fs::read_to_string(dist_dir.join(BUILD_FLAGS_FILE))
+        .map(|current| current.trim() != desired_flags)
+        .unwrap_or(true);
+
+    let needs_build = flags_changed
+        || should_build_frontend(&source_dir, &index).expect("check frontend asset freshness");
+    if needs_build {
         let pnpm = which::which("pnpm").expect("pnpm");
+        let build_env = [(
+            "VITE_PRESETS_ENABLED",
+            if presets_enabled { "true" } else { "false" },
+        )];
         run_pnpm(
             &pnpm,
             &source_dir,
             &["install"],
+            &[],
             "install frontend dependencies",
         );
         run_pnpm(
             &pnpm,
             &source_dir,
             &["run", "build"],
+            &build_env,
             "build frontend assets",
         );
+        fs::write(dist_dir.join(BUILD_FLAGS_FILE), &desired_flags)
+            .expect("write frontend build flags");
     }
 
     let mut files = Vec::new();
@@ -81,10 +103,19 @@ fn should_skip_source_path(path: &Path) -> bool {
     )
 }
 
-fn run_pnpm(pnpm: &Path, source_dir: &Path, args: &[&str], description: &str) {
-    let status = Command::new(pnpm)
-        .args(args)
-        .current_dir(source_dir)
+fn run_pnpm(
+    pnpm: &Path,
+    source_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    description: &str,
+) {
+    let mut command = Command::new(pnpm);
+    command.args(args).current_dir(source_dir);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .unwrap_or_else(|error| panic!("{description}: {error}"));
     assert!(status.success(), "{description}: {status}");
@@ -96,6 +127,15 @@ fn collect_files(root: &Path, dir: &Path, files: &mut Vec<String>) -> io::Result
         let path = entry.path();
         if path.is_dir() {
             collect_files(root, &path, files)?;
+            continue;
+        }
+
+        // Skip bookkeeping files (e.g. the build-flags marker); they are not servable assets.
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'))
+        {
             continue;
         }
 

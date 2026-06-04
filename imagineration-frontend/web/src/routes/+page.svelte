@@ -1,6 +1,10 @@
 <script>
   import { onMount } from 'svelte';
 
+  // Compiled-in feature flag, forwarded from the `presets` cargo feature by build.rs.
+  const presetsFeature = import.meta.env.VITE_PRESETS_ENABLED === 'true';
+  const TOKEN_STORAGE_KEY = 'imagineration.token';
+
   const presetOptions = [
     'qwen_image',
     'z_image_turbo',
@@ -52,6 +56,26 @@
   let error = '';
   let notice = '';
 
+  // Authentication state.
+  let token = '';
+  let capabilities = null;
+  let authReady = false;
+  let username = '';
+  let password = '';
+  let manualToken = '';
+  let loginError = '';
+  let loggingIn = false;
+
+  // Object URLs for protected images, keyed by their original URL.
+  let blobUrls = {};
+  const blobPending = new Set();
+
+  // User-defined presets.
+  let presets = [];
+  let presetName = '';
+  let selectedPresetId = '';
+  let loadingPresets = false;
+
   let mode = 'checkpoint';
   let model = '';
   let preset = 'qwen_image';
@@ -87,13 +111,106 @@
   $: syncLoraModel(loraModels);
   $: visibleImages = images.slice(0, 24);
   $: requestPreview = previewRequest();
+  $: needsLogin = authReady && capabilities?.auth?.required && !token;
+  $: presetsEnabled = presetsFeature && capabilities?.presets === true;
 
-  onMount(() => {
-    refresh();
+  onMount(async () => {
+    token = localStorage.getItem(TOKEN_STORAGE_KEY) || '';
+    await loadCapabilities();
+    if (!needsLogin) {
+      await refresh();
+    }
   });
 
+  // --- Authentication -------------------------------------------------------
+
+  function authHeaders(extra = {}) {
+    return token ? { ...extra, Authorization: `Bearer ${token}` } : { ...extra };
+  }
+
+  // Computed directly (not via the reactive `presetsEnabled`) so callers see the current value
+  // immediately after `capabilities` loads, before Svelte flushes reactive declarations.
+  function arePresetsEnabled() {
+    return presetsFeature && capabilities?.presets === true;
+  }
+
+  async function loadCapabilities() {
+    try {
+      const response = await fetch('/v1/capabilities');
+      capabilities = response.ok ? await response.json() : null;
+    } catch {
+      capabilities = null;
+    } finally {
+      authReady = true;
+    }
+  }
+
+  function persistToken(value) {
+    token = value;
+    if (value) {
+      localStorage.setItem(TOKEN_STORAGE_KEY, value);
+    } else {
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+  }
+
+  function clearToken() {
+    persistToken('');
+    revokeBlobs();
+    models = [];
+    images = [];
+    presets = [];
+    selectedImage = null;
+    metadata = null;
+  }
+
+  async function login() {
+    loginError = '';
+    loggingIn = true;
+    try {
+      const response = await fetch('/v1/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      const data = await responseJson(response);
+      if (!response.ok) {
+        throw new Error(errorMessage(data, response.status));
+      }
+      password = '';
+      persistToken(data.access_token);
+      await refresh();
+    } catch (caught) {
+      loginError = caught.message;
+    } finally {
+      loggingIn = false;
+    }
+  }
+
+  async function useManualToken() {
+    loginError = '';
+    if (!manualToken.trim()) {
+      loginError = 'Enter a token';
+      return;
+    }
+    persistToken(manualToken.trim());
+    manualToken = '';
+    await refresh();
+  }
+
+  function logout() {
+    clearToken();
+  }
+
+  // --- Data loading ---------------------------------------------------------
+
   async function refresh() {
-    await Promise.all([loadModels(), loadImages()]);
+    error = '';
+    const tasks = [loadModels(), loadImages()];
+    if (arePresetsEnabled()) {
+      tasks.push(loadPresets());
+    }
+    await Promise.all(tasks);
   }
 
   async function loadModels() {
@@ -247,9 +364,13 @@
       const payload = buildRequest(true);
       const response = await fetch('/v1/images:generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload)
       });
+      if (response.status === 401) {
+        handleUnauthorized();
+        return;
+      }
       const data = await responseJson(response);
       if (!response.ok) {
         throw new Error(errorMessage(data, response.status));
@@ -277,12 +398,21 @@
   }
 
   async function requestJson(url) {
-    const response = await fetch(url);
+    const response = await fetch(url, { headers: authHeaders() });
+    if (response.status === 401) {
+      handleUnauthorized();
+      throw new Error('Authentication required');
+    }
     const data = await responseJson(response);
     if (!response.ok) {
       throw new Error(errorMessage(data, response.status));
     }
     return data;
+  }
+
+  function handleUnauthorized() {
+    error = 'Session expired. Please sign in again.';
+    clearToken();
   }
 
   async function responseJson(response) {
@@ -300,6 +430,50 @@
   function errorMessage(data, status) {
     return data?.error?.message || `Request failed with ${status}`;
   }
+
+  // --- Protected image loading ----------------------------------------------
+  // <img> tags cannot carry a bearer token, so when authenticated we fetch the
+  // bytes ourselves and hand the element a blob URL.
+
+  function imageSource(url) {
+    if (!url || !token) {
+      return url;
+    }
+    if (blobUrls[url]) {
+      return blobUrls[url];
+    }
+    loadBlob(url);
+    return '';
+  }
+
+  async function loadBlob(url) {
+    if (blobPending.has(url)) {
+      return;
+    }
+    blobPending.add(url);
+    try {
+      const response = await fetch(url, { headers: authHeaders() });
+      if (!response.ok) {
+        return;
+      }
+      const blob = await response.blob();
+      blobUrls = { ...blobUrls, [url]: URL.createObjectURL(blob) };
+    } catch {
+      // Leave the placeholder in place on failure.
+    } finally {
+      blobPending.delete(url);
+    }
+  }
+
+  function revokeBlobs() {
+    for (const url of Object.values(blobUrls)) {
+      URL.revokeObjectURL(url);
+    }
+    blobUrls = {};
+    blobPending.clear();
+  }
+
+  // --- Request building -----------------------------------------------------
 
   function previewRequest() {
     try {
@@ -396,6 +570,135 @@
     return parsed;
   }
 
+  // --- User-defined presets -------------------------------------------------
+
+  async function loadPresets() {
+    if (!arePresetsEnabled()) {
+      return;
+    }
+    loadingPresets = true;
+    try {
+      const data = await requestJson('/v1/presets');
+      presets = data.presets || [];
+    } catch (caught) {
+      error = caught.message;
+    } finally {
+      loadingPresets = false;
+    }
+  }
+
+  function buildPresetContent() {
+    // The preset body mirrors the generation request, plus the UI mode hint.
+    return { mode, ...buildRequest(false) };
+  }
+
+  async function savePreset() {
+    error = '';
+    notice = '';
+    const name = presetName.trim();
+    if (!name) {
+      error = 'Preset name is required';
+      return;
+    }
+    try {
+      const response = await fetch('/v1/presets', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ name, content: buildPresetContent() })
+      });
+      if (response.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      const data = await responseJson(response);
+      if (!response.ok) {
+        throw new Error(errorMessage(data, response.status));
+      }
+      presetName = '';
+      notice = `Saved preset "${name}"`;
+      await loadPresets();
+      selectedPresetId = data.id;
+    } catch (caught) {
+      error = caught.message;
+    }
+  }
+
+  function loadSelectedPreset() {
+    const found = presets.find((item) => item.id === selectedPresetId);
+    if (!found) {
+      return;
+    }
+    applyPresetContent(found.content || {});
+    notice = `Loaded preset "${found.name}"`;
+  }
+
+  async function deleteSelectedPreset() {
+    if (!selectedPresetId) {
+      return;
+    }
+    error = '';
+    try {
+      const response = await fetch(`/v1/presets/${selectedPresetId}`, {
+        method: 'DELETE',
+        headers: authHeaders()
+      });
+      if (response.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      if (!response.ok && response.status !== 404) {
+        const data = await responseJson(response);
+        throw new Error(errorMessage(data, response.status));
+      }
+      selectedPresetId = '';
+      notice = 'Preset deleted';
+      await loadPresets();
+    } catch (caught) {
+      error = caught.message;
+    }
+  }
+
+  function applyPresetContent(content) {
+    const rest = { ...content };
+    const take = (key) => {
+      const value = rest[key];
+      delete rest[key];
+      return value;
+    };
+
+    mode = take('mode') || (content.preset ? 'preset' : content.diffusion_model ? 'split' : 'checkpoint');
+    if ('model' in rest) model = take('model') || '';
+    if ('diffusion_model' in rest) diffusionModel = take('diffusion_model') || '';
+    if ('text_encoders' in rest) {
+      const encoders = take('text_encoders');
+      textEncoders = Array.isArray(encoders) ? encoders.join('\n') : (encoders || '');
+    }
+    if ('vae' in rest) vae = take('vae') || '';
+    if ('preset' in rest) preset = take('preset') || preset;
+    if ('preset_weight_type' in rest) presetWeightType = take('preset_weight_type') || '';
+    if ('loras' in rest) {
+      const loras = take('loras');
+      selectedLoras = Array.isArray(loras)
+        ? loras.map((item) => ({ name: item.file_name, file_name: item.file_name, weight: item.weight }))
+        : [];
+    }
+    if ('lora_apply_mode' in rest) loraApplyMode = take('lora_apply_mode') || 'auto';
+    if ('prompt' in rest) prompt = take('prompt') || '';
+    if ('negative_prompt' in rest) negativePrompt = take('negative_prompt') || '';
+    if ('width' in rest) width = take('width');
+    if ('height' in rest) height = take('height');
+    if ('steps' in rest) steps = take('steps');
+    if ('cfg_scale' in rest) cfgScale = take('cfg_scale');
+    if ('guidance' in rest) guidance = take('guidance');
+    if ('seed' in rest) seed = take('seed');
+    if ('batch_count' in rest) batchCount = take('batch_count');
+    if ('sampling_method' in rest) samplingMethod = take('sampling_method') || '';
+    if ('scheduler' in rest) scheduler = take('scheduler') || '';
+
+    // Anything else round-trips through the advanced JSON box.
+    advancedJson = Object.keys(rest).length ? JSON.stringify(rest, null, 2) : '';
+  }
+
   function formatDate(value) {
     return new Intl.DateTimeFormat(undefined, {
       dateStyle: 'medium',
@@ -408,283 +711,359 @@
   <title>Imagineration</title>
 </svelte:head>
 
-<div class="shell">
-  <header class="topbar">
-    <div>
+{#if needsLogin}
+  <div class="auth-shell">
+    <section class="auth-card" aria-label="Sign in">
       <h1>Imagineration</h1>
-      <div class="subtle">{models.length} models · {images.length} images</div>
-    </div>
-    <div class="status-line">
-      {#if error}
-        <span class="error">{error}</span>
-      {:else if notice}
-        <span class="notice">{notice}</span>
-      {:else if generating}
-        <span>Generating</span>
-      {:else if loadingModels || loadingImages}
-        <span>Loading</span>
-      {:else}
-        <span>Ready</span>
+      <p class="subtle">Authentication is required to use this server.</p>
+
+      {#if capabilities?.auth?.login}
+        <form on:submit|preventDefault={login}>
+          <label>
+            <span>Username</span>
+            <input bind:value={username} autocomplete="username" />
+          </label>
+          <label>
+            <span>Password</span>
+            <input type="password" bind:value={password} autocomplete="current-password" />
+          </label>
+          <button type="submit" class="primary" disabled={loggingIn || !username}>
+            {loggingIn ? 'Signing in' : 'Sign in'}
+          </button>
+        </form>
+        <div class="auth-divider"><span>or</span></div>
       {/if}
-      <button type="button" class="secondary" on:click={refresh} disabled={loadingModels || loadingImages || generating}>
-        Refresh
-      </button>
-    </div>
-  </header>
 
-  <main class="workspace">
-    <section class="panel composer" aria-label="Generate">
-      <div class="panel-head">
-        <h2>Generate</h2>
-        <div class="segments" role="tablist" aria-label="Model mode">
-          <button type="button" class:active={mode === 'checkpoint'} on:click={() => (mode = 'checkpoint')}>
-            Checkpoint
-          </button>
-          <button type="button" class:active={mode === 'split'} on:click={() => (mode = 'split')}>
-            Split
-          </button>
-          <button type="button" class:active={mode === 'preset'} on:click={() => (mode = 'preset')}>
-            Preset
-          </button>
-        </div>
+      <form on:submit|preventDefault={useManualToken}>
+        <label>
+          <span>Bearer token</span>
+          <input
+            bind:value={manualToken}
+            placeholder="Paste a token (e.g. from your IdP)"
+            autocomplete="off"
+          />
+        </label>
+        <button type="submit" class="secondary" disabled={!manualToken.trim()}>Use token</button>
+      </form>
+
+      {#if loginError}
+        <p class="error">{loginError}</p>
+      {/if}
+    </section>
+  </div>
+{:else}
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <h1>Imagineration</h1>
+        <div class="subtle">{models.length} models · {images.length} images</div>
       </div>
-
-      <form on:submit|preventDefault={generate}>
-        {#if mode === 'checkpoint'}
-          <label>
-            <span>Checkpoint filter</span>
-            <input bind:value={checkpointModelFilter} autocomplete="off" />
-          </label>
-          <label>
-            <span>Checkpoint</span>
-            <select bind:value={model}>
-              {#each checkpointModels as item}
-                <option value={modelName(item)}>{modelName(item)}</option>
-              {/each}
-            </select>
-          </label>
-        {:else if mode === 'split'}
-          <label>
-            <span>Split model filter</span>
-            <input bind:value={splitModelFilter} autocomplete="off" />
-          </label>
-          <label>
-            <span>Diffusion model</span>
-            <select bind:value={diffusionModel}>
-              {#each diffusionModels as item}
-                <option value={modelName(item)}>{modelName(item)}</option>
-              {/each}
-            </select>
-          </label>
-          <label>
-            <span>Text encoders</span>
-            <textarea bind:value={textEncoders} rows="3"></textarea>
-          </label>
-          <label>
-            <span>VAE</span>
-            <select bind:value={vae}>
-              <option value="">Auto</option>
-              {#each vaeModels as item}
-                <option value={modelName(item)}>{modelName(item)}</option>
-              {/each}
-            </select>
-          </label>
+      <div class="status-line">
+        {#if error}
+          <span class="error">{error}</span>
+        {:else if notice}
+          <span class="notice">{notice}</span>
+        {:else if generating}
+          <span>Generating</span>
+        {:else if loadingModels || loadingImages}
+          <span>Loading</span>
         {:else}
-          <div class="two-col">
-            <label>
-              <span>Preset</span>
-              <select bind:value={preset}>
-                {#each presetOptions as item}
-                  <option value={item}>{item}</option>
+          <span>Ready</span>
+        {/if}
+        <button type="button" class="secondary" on:click={refresh} disabled={loadingModels || loadingImages || generating}>
+          Refresh
+        </button>
+        {#if token}
+          <button type="button" class="secondary" on:click={logout}>Sign out</button>
+        {/if}
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel composer" aria-label="Generate">
+        <div class="panel-head">
+          <h2>Generate</h2>
+          <div class="segments" role="tablist" aria-label="Model mode">
+            <button type="button" class:active={mode === 'checkpoint'} on:click={() => (mode = 'checkpoint')}>
+              Checkpoint
+            </button>
+            <button type="button" class:active={mode === 'split'} on:click={() => (mode = 'split')}>
+              Split
+            </button>
+            <button type="button" class:active={mode === 'preset'} on:click={() => (mode = 'preset')}>
+              Preset
+            </button>
+          </div>
+        </div>
+
+        {#if presetsEnabled}
+          <div class="presets-box">
+            <div class="presets-head">
+              <h3>My presets</h3>
+              <button type="button" class="secondary" on:click={loadPresets} disabled={loadingPresets}>
+                Reload
+              </button>
+            </div>
+            <div class="presets-row">
+              <select bind:value={selectedPresetId}>
+                <option value="">Select a preset…</option>
+                {#each presets as item}
+                  <option value={item.id}>{item.name}</option>
                 {/each}
               </select>
-            </label>
-            <label>
-              <span>Weight type</span>
-              <input bind:value={presetWeightType} autocomplete="off" />
-            </label>
+              <button type="button" class="secondary" on:click={loadSelectedPreset} disabled={!selectedPresetId}>
+                Load
+              </button>
+              <button type="button" class="secondary" on:click={deleteSelectedPreset} disabled={!selectedPresetId}>
+                Delete
+              </button>
+            </div>
+            <div class="presets-row save">
+              <input bind:value={presetName} placeholder="New preset name" autocomplete="off" />
+              <button type="button" class="secondary" on:click={savePreset} disabled={!presetName.trim()}>
+                Save current
+              </button>
+            </div>
           </div>
         {/if}
 
-        <div class="lora-box">
-          <div class="lora-head">
-            <h3>LoRA</h3>
+        <form on:submit|preventDefault={generate}>
+          {#if mode === 'checkpoint'}
             <label>
-              <span>Apply mode</span>
-              <select bind:value={loraApplyMode}>
-                {#each loraApplyModeOptions as item}
-                  <option value={item}>{item}</option>
+              <span>Checkpoint filter</span>
+              <input bind:value={checkpointModelFilter} autocomplete="off" />
+            </label>
+            <label>
+              <span>Checkpoint</span>
+              <select bind:value={model}>
+                {#each checkpointModels as item}
+                  <option value={modelName(item)}>{modelName(item)}</option>
                 {/each}
               </select>
             </label>
-          </div>
-
-          <label>
-            <span>LoRA filter</span>
-            <input bind:value={loraFilter} autocomplete="off" />
-          </label>
-
-          <div class="lora-add">
+          {:else if mode === 'split'}
             <label>
-              <span>LoRA</span>
-              <select bind:value={loraModel} disabled={loraModels.length === 0}>
-                {#each loraModels as item}
-                  <option value={modelName(item)} disabled={hasSelectedLora(modelName(item))}>
-                    {modelName(item)}
-                  </option>
+              <span>Split model filter</span>
+              <input bind:value={splitModelFilter} autocomplete="off" />
+            </label>
+            <label>
+              <span>Diffusion model</span>
+              <select bind:value={diffusionModel}>
+                {#each diffusionModels as item}
+                  <option value={modelName(item)}>{modelName(item)}</option>
                 {/each}
               </select>
             </label>
             <label>
-              <span>Weight</span>
-              <input type="number" step="0.05" bind:value={loraWeight} />
+              <span>Text encoders</span>
+              <textarea bind:value={textEncoders} rows="3"></textarea>
             </label>
-            <button
-              type="button"
-              class="secondary add-lora"
-              on:click={addLora}
-              disabled={!loraModel || hasSelectedLora(loraModel) || !isValidLoraWeight(loraWeight)}
-            >
-              Add
-            </button>
-          </div>
-
-          {#if selectedLoras.length > 0}
-            <div class="selected-loras">
-              {#each selectedLoras as item, index}
-                <div class="selected-lora">
-                  <div>
-                    <strong>{item.name}</strong>
-                    <span>{item.file_name}</span>
-                  </div>
-                  <input
-                    aria-label={`Weight for ${item.name}`}
-                    type="number"
-                    step="0.05"
-                    value={item.weight}
-                    on:input={(event) => updateLoraWeight(index, event.currentTarget.value)}
-                  />
-                  <button type="button" class="secondary" on:click={() => removeLora(index)}>
-                    Remove
-                  </button>
-                </div>
-              {/each}
+            <label>
+              <span>VAE</span>
+              <select bind:value={vae}>
+                <option value="">Auto</option>
+                {#each vaeModels as item}
+                  <option value={modelName(item)}>{modelName(item)}</option>
+                {/each}
+              </select>
+            </label>
+          {:else}
+            <div class="two-col">
+              <label>
+                <span>Preset</span>
+                <select bind:value={preset}>
+                  {#each presetOptions as item}
+                    <option value={item}>{item}</option>
+                  {/each}
+                </select>
+              </label>
+              <label>
+                <span>Weight type</span>
+                <input bind:value={presetWeightType} autocomplete="off" />
+              </label>
             </div>
           {/if}
-        </div>
 
-        <label>
-          <span>Prompt</span>
-          <textarea bind:value={prompt} rows="5"></textarea>
-        </label>
-        <label>
-          <span>Negative prompt</span>
-          <textarea bind:value={negativePrompt} rows="3"></textarea>
-        </label>
+          <div class="lora-box">
+            <div class="lora-head">
+              <h3>LoRA</h3>
+              <label>
+                <span>Apply mode</span>
+                <select bind:value={loraApplyMode}>
+                  {#each loraApplyModeOptions as item}
+                    <option value={item}>{item}</option>
+                  {/each}
+                </select>
+              </label>
+            </div>
 
-        <div class="grid-fields">
-          <label>
-            <span>Width</span>
-            <input type="number" min="8" max="4096" step="8" bind:value={width} />
-          </label>
-          <label>
-            <span>Height</span>
-            <input type="number" min="8" max="4096" step="8" bind:value={height} />
-          </label>
-          <label>
-            <span>Steps</span>
-            <input type="number" min="1" max="10000" bind:value={steps} />
-          </label>
-          <label>
-            <span>Batch</span>
-            <input type="number" min="1" max="256" bind:value={batchCount} />
-          </label>
-          <label>
-            <span>CFG</span>
-            <input type="number" min="0" step="0.1" bind:value={cfgScale} />
-          </label>
-          <label>
-            <span>Guidance</span>
-            <input type="number" min="0" step="0.1" bind:value={guidance} />
-          </label>
-          <label>
-            <span>Seed</span>
-            <input type="number" bind:value={seed} />
-          </label>
-          <label>
-            <span>Sampler</span>
-            <select bind:value={samplingMethod}>
-              {#each samplerOptions as item}
-                <option value={item}>{item || 'Auto'}</option>
-              {/each}
-            </select>
-          </label>
-          <label>
-            <span>Scheduler</span>
-            <select bind:value={scheduler}>
-              {#each schedulerOptions as item}
-                <option value={item}>{item || 'Auto'}</option>
-              {/each}
-            </select>
-          </label>
-        </div>
+            <label>
+              <span>LoRA filter</span>
+              <input bind:value={loraFilter} autocomplete="off" />
+            </label>
 
-        <label>
-          <span>Advanced JSON</span>
-          <textarea bind:value={advancedJson} rows="6" spellcheck="false"></textarea>
-        </label>
+            <div class="lora-add">
+              <label>
+                <span>LoRA</span>
+                <select bind:value={loraModel} disabled={loraModels.length === 0}>
+                  {#each loraModels as item}
+                    <option value={modelName(item)} disabled={hasSelectedLora(modelName(item))}>
+                      {modelName(item)}
+                    </option>
+                  {/each}
+                </select>
+              </label>
+              <label>
+                <span>Weight</span>
+                <input type="number" step="0.05" bind:value={loraWeight} />
+              </label>
+              <button
+                type="button"
+                class="secondary add-lora"
+                on:click={addLora}
+                disabled={!loraModel || hasSelectedLora(loraModel) || !isValidLoraWeight(loraWeight)}
+              >
+                Add
+              </button>
+            </div>
 
-        <button type="submit" class="primary" disabled={generating}>
-          {generating ? 'Generating' : 'Generate'}
-        </button>
-      </form>
-    </section>
-
-    <section class="panel request-panel" aria-label="Request">
-      <div class="panel-head">
-        <h2>Request</h2>
-      </div>
-      <pre>{requestPreview}</pre>
-    </section>
-
-    <section class="panel result-panel" aria-label="Images">
-      <div class="panel-head">
-        <h2>Images</h2>
-        <button type="button" class="secondary" on:click={loadImages} disabled={loadingImages || generating}>
-          Reload
-        </button>
-      </div>
-
-      {#if selectedImage}
-        <div class="selected">
-          <img src={selectedImage.image_url} alt="Generated result" />
-          <div class="selected-meta">
-            <strong>{selectedImage.id}</strong>
-            <span>{formatDate(selectedImage.created_at)}</span>
+            {#if selectedLoras.length > 0}
+              <div class="selected-loras">
+                {#each selectedLoras as item, index}
+                  <div class="selected-lora">
+                    <div>
+                      <strong>{item.name}</strong>
+                      <span>{item.file_name}</span>
+                    </div>
+                    <input
+                      aria-label={`Weight for ${item.name}`}
+                      type="number"
+                      step="0.05"
+                      value={item.weight}
+                      on:input={(event) => updateLoraWeight(index, event.currentTarget.value)}
+                    />
+                    <button type="button" class="secondary" on:click={() => removeLora(index)}>
+                      Remove
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
           </div>
-        </div>
-      {/if}
 
-      <div class="gallery">
-        {#each visibleImages as image}
-          <button
-            type="button"
-            class="tile"
-            class:selected={selectedImage?.id === image.id}
-            on:click={() => selectImage(image)}
-          >
-            <img src={image.image_url} alt="Generated thumbnail" loading="lazy" />
-            <span>{formatDate(image.created_at)}</span>
+          <label>
+            <span>Prompt</span>
+            <textarea bind:value={prompt} rows="5"></textarea>
+          </label>
+          <label>
+            <span>Negative prompt</span>
+            <textarea bind:value={negativePrompt} rows="3"></textarea>
+          </label>
+
+          <div class="grid-fields">
+            <label>
+              <span>Width</span>
+              <input type="number" min="8" max="4096" step="8" bind:value={width} />
+            </label>
+            <label>
+              <span>Height</span>
+              <input type="number" min="8" max="4096" step="8" bind:value={height} />
+            </label>
+            <label>
+              <span>Steps</span>
+              <input type="number" min="1" max="10000" bind:value={steps} />
+            </label>
+            <label>
+              <span>Batch</span>
+              <input type="number" min="1" max="256" bind:value={batchCount} />
+            </label>
+            <label>
+              <span>CFG</span>
+              <input type="number" min="0" step="0.1" bind:value={cfgScale} />
+            </label>
+            <label>
+              <span>Guidance</span>
+              <input type="number" min="0" step="0.1" bind:value={guidance} />
+            </label>
+            <label>
+              <span>Seed</span>
+              <input type="number" bind:value={seed} />
+            </label>
+            <label>
+              <span>Sampler</span>
+              <select bind:value={samplingMethod}>
+                {#each samplerOptions as item}
+                  <option value={item}>{item || 'Auto'}</option>
+                {/each}
+              </select>
+            </label>
+            <label>
+              <span>Scheduler</span>
+              <select bind:value={scheduler}>
+                {#each schedulerOptions as item}
+                  <option value={item}>{item || 'Auto'}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+
+          <label>
+            <span>Advanced JSON</span>
+            <textarea bind:value={advancedJson} rows="6" spellcheck="false"></textarea>
+          </label>
+
+          <button type="submit" class="primary" disabled={generating}>
+            {generating ? 'Generating' : 'Generate'}
           </button>
-        {/each}
-      </div>
+        </form>
+      </section>
 
-      {#if metadata}
-        <pre class="metadata">{JSON.stringify(metadata, null, 2)}</pre>
-      {/if}
-    </section>
-  </main>
-</div>
+      <section class="panel request-panel" aria-label="Request">
+        <div class="panel-head">
+          <h2>Request</h2>
+        </div>
+        <pre>{requestPreview}</pre>
+      </section>
+
+      <section class="panel result-panel" aria-label="Images">
+        <div class="panel-head">
+          <h2>Images</h2>
+          <button type="button" class="secondary" on:click={loadImages} disabled={loadingImages || generating}>
+            Reload
+          </button>
+        </div>
+
+        {#if selectedImage}
+          <div class="selected">
+            <img src={imageSource(selectedImage.image_url)} alt="Generated result" />
+            <div class="selected-meta">
+              <strong>{selectedImage.id}</strong>
+              <span>{formatDate(selectedImage.created_at)}</span>
+            </div>
+          </div>
+        {/if}
+
+        <div class="gallery">
+          {#each visibleImages as image}
+            <button
+              type="button"
+              class="tile"
+              class:selected={selectedImage?.id === image.id}
+              on:click={() => selectImage(image)}
+            >
+              <img src={imageSource(image.image_url)} alt="Generated thumbnail" loading="lazy" />
+              <span>{formatDate(image.created_at)}</span>
+            </button>
+          {/each}
+        </div>
+
+        {#if metadata}
+          <pre class="metadata">{JSON.stringify(metadata, null, 2)}</pre>
+        {/if}
+      </section>
+    </main>
+  </div>
+{/if}
 
 <style>
   :global(*) {
@@ -780,6 +1159,46 @@
 
   .notice {
     color: #7bd389;
+  }
+
+  .auth-shell {
+    display: grid;
+    place-items: center;
+    min-height: 100vh;
+    padding: 20px;
+  }
+
+  .auth-card {
+    width: min(420px, 100%);
+    display: grid;
+    gap: 14px;
+    padding: 28px;
+    border: 1px solid #34332f;
+    border-radius: 12px;
+    background: rgba(25, 25, 24, 0.96);
+    box-shadow: 0 18px 42px rgba(0, 0, 0, 0.28);
+  }
+
+  .auth-card form {
+    display: grid;
+    gap: 12px;
+    padding: 0;
+  }
+
+  .auth-divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: #aaa49a;
+    font-size: 12px;
+  }
+
+  .auth-divider::before,
+  .auth-divider::after {
+    content: '';
+    height: 1px;
+    flex: 1;
+    background: #34332f;
   }
 
   .workspace {
@@ -896,13 +1315,36 @@
     line-height: 1.2;
   }
 
-  .lora-box {
+  .lora-box,
+  .presets-box {
     display: grid;
     gap: 12px;
     padding: 12px;
     border: 1px solid #34332f;
     border-radius: 8px;
     background: #151411;
+  }
+
+  .presets-box {
+    margin: 0 16px;
+  }
+
+  .presets-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .presets-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 76px 76px;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .presets-row.save {
+    grid-template-columns: minmax(0, 1fr) 120px;
   }
 
   .lora-head {

@@ -12,5 +12,10 @@ http-body-util = "0.1"
 tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }
 
+[features]
+# Builds the SPA with the user-defined preset UI enabled. The build script forwards this to the
+# Vite build as `VITE_PRESETS_ENABLED`, and rebuilds the assets when the flag changes.
+presets = []
+
 [build-dependencies]
 which = { workspace = true }
